@@ -113,6 +113,15 @@ To ensure best chance of getting this to work:
 
 For the backend that supports professional-grade audio paths in BQDTS, see [bqdts-backend](https://github.com/stg/bqdts-backend).
 
+## Attribution
+
+- [EarLevel biquad calculator v3](https://www.earlevel.com/main/2021/09/02/biquad-calculator-v3/)
+  Used as a reference for biquad math and filter formulation.
+- [mariosgit/TAS58xx](https://github.com/mariosgit/TAS58xx)
+  Used as a reference for initial exploration of TAS58xx amplifier DSP setup.
+- [PJRC Teensy Audio Library](https://github.com/PaulStoffregen/Audio/)
+  Used as a reference while writing the SGTL5000 driver.
+
 ## LICENSE
 
 This project is free for personal/non-commercial use.
