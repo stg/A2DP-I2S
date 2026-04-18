@@ -14,7 +14,7 @@
 #define USE_TAS5828M 1
 #define HAVE_VOL_POT 1 // else uses tas5828m_gain, sgtl5000_gain
 
-#define DEVICE_NAME "TAS5830"
+#define DEVICE_NAME "MySpeaker"
 
 /*
 TAS5828M
