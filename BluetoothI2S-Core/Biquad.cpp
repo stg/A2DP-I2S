@@ -22,7 +22,7 @@ int32_t floatQ(float f, uint8_t Q) {
     const float s = ldexpf(f, Q);
     return (s <= (float)INT32_MIN) ? INT32_MIN :
            (s >= (float)INT32_MAX) ? INT32_MAX :
-           (int32_t)lrintf(s);
+           (int32_t)lroundf(s);
 }
 
 // Convert fixed-point Qn representation to float

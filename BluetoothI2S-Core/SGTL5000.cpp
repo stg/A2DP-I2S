@@ -21,11 +21,12 @@ void SGTL5000_Driver::writeDapBlock(uint16_t start_reg, const uint16_t *data, ui
 	}
 }
 
-// Common volume calculation
-static uint8_t scale_volume(float n, uint8_t range) {
-	n = (n * (float)range) + 0.5f;
-	if(n > range) n = range;
-	return (uint8_t)n;
+// Common rounded scaling calculation
+static inline uint8_t scale_code(float value, float multiplier, float offset, uint8_t min_code, uint8_t max_code) {
+	float code = value * multiplier + offset;
+	if(code < min_code) return min_code;
+	if(code > max_code) return max_code;
+	return (uint8_t)lroundf(code);
 }
 
 typedef enum {
@@ -109,8 +110,7 @@ void SGTL5000_Driver::init(audio_samplerate samplerate) {
 	write(SGTL5000_SSS_CTRL,      0x0010); // ADC->I2S, I2S->DAC
 	// Default to post-DAC DAP processing with the full PEQ stage count available.
 	dapSetup(SGTL5000_DAP_POST);
-	eqSelect(SGTL5000_EQ_PEQ);
-	eqFilterCount(7);
+	eqModeSetup(SGTL5000_EQ_PEQ, 7);
 	delay(25);
 	write(SGTL5000_ADCDAC_CTRL,   0x0000); // DAC unmute
 	write(SGTL5000_ANA_CTRL,      0x0036); // Zero-cross detect active, playback path unmuted
@@ -123,11 +123,11 @@ void SGTL5000_Driver::hpVolumeRaw(uint8_t left, uint8_t right) {
 }
 
 void SGTL5000_Driver::hpVolume(float left_norm, float right_norm) {
-	hpVolumeRaw(0x7F - scale_volume(left_norm, 0x7F), 0x7F - scale_volume(right_norm, 0x7F));
+	hpVolumeRaw(scale_code(left_norm, -0x7F, 0x7F, 0, 0x7F), scale_code(right_norm, -0x7F, 0x7F, 0, 0x7F));
 }
 
 void SGTL5000_Driver::hpVolume(float vol_norm) {
-  const uint8_t raw = 0x7F - scale_volume(vol_norm, 0x7F);
+  const uint8_t raw = scale_code(vol_norm, -0x7F, 0x7F, 0, 0x7F);
   hpVolumeRaw(raw, raw);
 }
 
@@ -204,13 +204,13 @@ void SGTL5000_Driver::volume(float l_gain_db, float r_gain_db) {
 	uint8_t l_gain;
 	if(l_gain_db <= SGTL5000_GAIN_LO) l_gain = 0xFC;
 	else if(l_gain_db > 0) l_gain = 0x3C;
-	else l_gain = 0x3C - (int)roundf(l_gain_db * 2);
+	else l_gain = scale_code(l_gain_db, -2.0f, 0x3C, 0x3C, 0xF0);
 
 	uint8_t r_gain = l_gain;
 	if(isfinite(r_gain_db)) {
 		if(r_gain_db <= SGTL5000_GAIN_LO) r_gain = 0xFC;
 		else if(r_gain_db > 0) r_gain = 0x3C;
-		else r_gain = 0x3C - (int)roundf(r_gain_db * 2);
+		else r_gain = scale_code(r_gain_db, -2.0f, 0x3C, 0x3C, 0xF0);
 	}
   volumeRaw(l_gain, r_gain);
 }
@@ -237,37 +237,30 @@ void SGTL5000_Driver::dapSetup(sgtl5000_dap_mode mode) {
 	}
 }
 
-void SGTL5000_Driver::eqSelect(sgtl5000_eq eq) {
+void SGTL5000_Driver::eqModeSetup(sgtl5000_eq eq, uint8_t peqCount) {
 	write(SGTL5000_DAP_AUDIO_EQ, (uint16_t)eq & 3);
+	write(SGTL5000_DAP_PEQ, (uint16_t)(peqCount & 7));
 }
 
-void SGTL5000_Driver::eqFilterCount(uint8_t count) {
-	write(SGTL5000_DAP_PEQ, (uint16_t)(count & 7));
-}
-
-void SGTL5000_Driver::geqBandRaw(uint8_t band, uint8_t gain) {
+void SGTL5000_Driver::geqBandSetRaw(uint8_t band, uint8_t gain) {
 	write(SGTL5000_DAP_AUDIO_EQ_BASS_BAND0 + (2 * band), gain);
 }
 
-void SGTL5000_Driver::geqBand(uint8_t band, float gain_norm) {
-	gain_norm=(gain_norm * 48) + 0.499;
-	if(gain_norm < -47) gain_norm = -47;
-	if(gain_norm > +48) gain_norm = +48;
-	gain_norm += 47;
-	geqBandRaw(band, (uint8_t)gain_norm);
+void SGTL5000_Driver::geqBandSet(uint8_t band, float gain_norm) {
+	geqBandSetRaw(band, scale_code(gain_norm, 48, 47, 0, 95));
 }
 
 void SGTL5000_Driver::geqSetup(float bass_norm, float mid_bass_norm, float midrange_norm, float mid_treble_norm, float treble_norm) {
-	geqBand(0, bass_norm);
-	geqBand(1, mid_bass_norm);
-	geqBand(2, midrange_norm);
-	geqBand(3, mid_treble_norm);
-	geqBand(4, treble_norm);
+	geqBandSet(0, bass_norm);
+	geqBandSet(1, mid_bass_norm);
+	geqBandSet(2, midrange_norm);
+	geqBandSet(3, mid_treble_norm);
+	geqBandSet(4, treble_norm);
 }
 
 void SGTL5000_Driver::geqSetup(float bass_norm, float treble_norm) {
-	geqBand(0, bass_norm);
-	geqBand(4, treble_norm);
+	geqBandSet(0, bass_norm);
+	geqBandSet(4, treble_norm);
 }
 
 void SGTL5000_Driver::biquadSet(audio_channel ch, uint8_t stage, biquad_filter &filter) {
@@ -298,11 +291,11 @@ void SGTL5000_Driver::avcSetupRaw(uint16_t threshold, uint16_t attack, uint16_t 
 	writeDapBlock(SGTL5000_DAP_AVC_CTRL, block, 4);
 }
 
-void SGTL5000_Driver::avcSetup(bool enabled, sgtl5000_avc_max_gain max_gain, sgtl5000_avc_lbi_response lbi_response, bool hard_limit, float threshold_db, float attack_dbps, float decay_dbps) {
+void SGTL5000_Driver::avcSetup(bool enabled, sgtl5000_avc_max_gain max_gain, sgtl5000_avc_smooth smooth, bool hard_limit, float threshold_db, float attack_dbps, float decay_dbps) {
 	uint16_t thresh = (pow(10, threshold_db / 20) * 0.636) * pow(2, 15);
 	uint16_t att = (1 - pow(10, -(attack_dbps / (20 * 44100)))) * pow(2, 19);
 	uint16_t dec = (1 - pow(10, -(decay_dbps / (20 * 44100)))) * pow(2, 23);
-	avcSetupRaw(thresh, att, dec, (((uint16_t)max_gain & 0x3) << 12) | (((uint16_t)lbi_response & 0x3) << 8) | ((hard_limit ? 1 : 0) << 5) | (enabled ? 1 : 0));
+	avcSetupRaw(thresh, att, dec, (((uint16_t)max_gain & 0x3) << 12) | (((uint16_t)smooth & 0x3) << 8) | ((hard_limit ? 1 : 0) << 5) | (enabled ? 1 : 0));
 }
 
 void SGTL5000_Driver::bassEnhanceSetupRaw(uint16_t bass_enhance, uint16_t bass_enhance_ctrl) {
@@ -312,7 +305,7 @@ void SGTL5000_Driver::bassEnhanceSetupRaw(uint16_t bass_enhance, uint16_t bass_e
 
 void SGTL5000_Driver::bassEnhanceSetup(bool enabled, float lr_mix_norm, float bass_gain_norm, bool hpf_bypass, sgtl5000_cutoff cutoff) {
 	bassEnhanceSetupRaw((enabled ? 1 : 0) | (((uint16_t)cutoff & 7) << 4) | ((hpf_bypass ? 1 : 0) << 8),
-                     ((0x3F - scale_volume(lr_mix_norm, 0x3F)) << 8) | (0x7F - scale_volume(bass_gain_norm, 0x7F)));
+                     (scale_code(lr_mix_norm, -0x3F, 0x3F, 0, 0x3F) << 8) | scale_code(bass_gain_norm, -0x7F, 0x7F, 0, 0x7F));
 }
 
 void SGTL5000_Driver::surroundSetupRaw(uint16_t surround) {

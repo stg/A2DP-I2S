@@ -61,11 +61,11 @@ typedef enum {
 } sgtl5000_avc_max_gain;
 
 typedef enum {
-  SGTL5000_AVC_LBI_RESPONSE_0 = 0,
-  SGTL5000_AVC_LBI_RESPONSE_1 = 1,
-  SGTL5000_AVC_LBI_RESPONSE_2 = 2,
-  SGTL5000_AVC_LBI_RESPONSE_3 = 3,
-} sgtl5000_avc_lbi_response;
+  SGTL5000_AVC_SMOOTH_0MS   = 0,
+  SGTL5000_AVC_SMOOTH_25MS  = 1,
+  SGTL5000_AVC_SMOOTH_50MS  = 2,
+  SGTL5000_AVC_SMOOTH_100MS = 3,
+} sgtl5000_avc_smooth;
 
 class SGTL5000_Driver : public Audio_Codec {
   uint8_t _address;    
@@ -100,16 +100,15 @@ public:
 	void volume(float l_gain_db, float r_gain_db = NAN) override;
 	void dacPathSetup(sgtl5000_dac_ramp ramp, sgtl5000_hpf hpf, audio_channel mute = CH_NONE);
 	void dapSetup(sgtl5000_dap_mode mode);
-	void eqSelect(sgtl5000_eq eq);
-	void eqFilterCount(uint8_t count);
-	void geqBandRaw(uint8_t band, uint8_t gain);
-	void geqBand(uint8_t band, float gain_norm);
+	void eqModeSetup(sgtl5000_eq eq, uint8_t peqCount = 7);
+	void geqBandSetRaw(uint8_t band, uint8_t gain);
+	void geqBandSet(uint8_t band, float gain_norm);
 	void geqSetup(float bass_norm, float mid_bass_norm, float midrange_norm, float mid_treble_norm, float treble_norm);
 	void geqSetup(float bass_norm, float treble_norm);
 	void biquadSet(audio_channel ch, uint8_t stage, biquad_filter &filter) override;
 	void biquadSet(audio_channel ch, uint8_t stage, biquad_filter_q &filter) override;
 	void avcSetupRaw(uint16_t threshold, uint16_t attack, uint16_t decay, uint16_t avc_ctrl);
-	void avcSetup(bool enabled, sgtl5000_avc_max_gain max_gain, sgtl5000_avc_lbi_response lbi_response, bool hard_limit, float threshold_db, float attack_dbps, float decay_dbps);
+	void avcSetup(bool enabled, sgtl5000_avc_max_gain max_gain, sgtl5000_avc_smooth smooth, bool hard_limit, float threshold_db, float attack_dbps, float decay_dbps);
 	void bassEnhanceSetupRaw(uint16_t bass_enhance, uint16_t bass_enhance_ctrl);
 	void bassEnhanceSetup(bool enabled, float lr_mix_norm, float bass_gain_norm, bool hpf_bypass = false, sgtl5000_cutoff cutoff = SGTL5000_CUTOFF_80HZ);
 	void surroundSetupRaw(uint16_t surround);
