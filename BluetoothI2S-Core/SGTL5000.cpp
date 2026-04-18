@@ -100,7 +100,7 @@ void SGTL5000_Driver::init(audio_samplerate samplerate) {
 	write(SGTL5000_DIG_POWER,     0x0073); // Power I2S in/out, DAP, DAC, ADC
 	delay(100);
 	write(SGTL5000_MIC_CTRL,      0x0000); // Mic off: no bias, min gain
-	write(SGTL5000_ANA_ADC_CTRL,  0x0000); // line/mic ADC PGA = 0 dB default
+	write(SGTL5000_ANA_ADC_CTRL,  0x0000); // Line/mic ADC PGA = 0 dB default
 	write(SGTL5000_LINE_OUT_VOL,  0x0F0F); // Line-out nominal 0 dB when LO_VAG == VAG
 	uint16_t sys_fs = 0x2; // Sample rate
 	if(samplerate == SR_32K ) sys_fs = 0;
