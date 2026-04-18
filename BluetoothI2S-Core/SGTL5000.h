@@ -4,8 +4,8 @@
 #include "Audio.h"
 #include "Biquad.h"
 
-#define SGTL5000_GAIN_LO  -90.0
-#define SGTL5000_GAIN_HI    0.0
+#define SGTL5000_GAIN_LO  -90.0f
+#define SGTL5000_GAIN_HI    0.0f
 #define SGTL5000_BQ_COUNT   7
 #define SGTL5000_BQ_Q      18
 

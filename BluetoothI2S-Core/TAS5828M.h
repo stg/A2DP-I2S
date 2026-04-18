@@ -3,10 +3,10 @@
 #include "Audio.h"
 #include "Biquad.h"
 
-#define TAS5828M_GAIN_LO  -104.0
-#define TAS5828M_GAIN_HI   +24.0
-#define TAS5828M_AGAIN_LO  -15.5
-#define TAS5828M_AGAIN_HI    0.0
+#define TAS5828M_GAIN_LO  -104.0f
+#define TAS5828M_GAIN_HI   +24.0f
+#define TAS5828M_AGAIN_LO  -15.5f
+#define TAS5828M_AGAIN_HI    0.0f
 #define TAS5828M_BQ_COUNT   16
 #define TAS5828M_BQ_Q       27
 

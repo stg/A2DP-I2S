@@ -173,7 +173,7 @@ void SGTL5000_Driver::micSetup(unsigned int gain_db, float bias_v) {
 
 	if(bias_v > 0) {
 		bias_resistor = 1 << 8; 
-		bias_voltage = ((uint16_t)((bias_v - 1.25) / 0.250 + 0.5)) << 4;
+		bias_voltage = (uint16_t)lroundf((bias_v - 1.25f) / 0.25f) << 4;
 	}
 
 	micSetupRaw(0x0170 | preamp_gain | bias_voltage | bias_resistor, (input_gain << 4) | input_gain);
@@ -201,18 +201,15 @@ void SGTL5000_Driver::volumeRaw(uint8_t l_vol, uint8_t r_vol) {
 }
 
 void SGTL5000_Driver::volume(float l_gain_db, float r_gain_db) {
-	uint8_t l_gain;
-	if(l_gain_db <= SGTL5000_GAIN_LO) l_gain = 0xFC;
-	else if(l_gain_db > 0) l_gain = 0x3C;
-	else l_gain = scale_code(l_gain_db, -2.0f, 0x3C, 0x3C, 0xF0);
+	uint8_t l_gain = scale_code(l_gain_db, -2.0f, 0x3C, 0x3C, 0xF1);
+	if(l_gain > 0xF0) l_gain = 0xFC;
 
 	uint8_t r_gain = l_gain;
 	if(isfinite(r_gain_db)) {
-		if(r_gain_db <= SGTL5000_GAIN_LO) r_gain = 0xFC;
-		else if(r_gain_db > 0) r_gain = 0x3C;
-		else r_gain = scale_code(r_gain_db, -2.0f, 0x3C, 0x3C, 0xF0);
+		r_gain = scale_code(r_gain_db, -2.0f, 0x3C, 0x3C, 0xF1);
+		if(r_gain > 0xF0) r_gain = 0xFC;
 	}
-  volumeRaw(l_gain, r_gain);
+	volumeRaw(l_gain, r_gain);
 }
 
 void SGTL5000_Driver::dacPathSetup(sgtl5000_dac_ramp ramp, sgtl5000_hpf hpf, audio_channel mute) {
@@ -292,9 +289,9 @@ void SGTL5000_Driver::avcSetupRaw(uint16_t threshold, uint16_t attack, uint16_t 
 }
 
 void SGTL5000_Driver::avcSetup(bool enabled, sgtl5000_avc_max_gain max_gain, sgtl5000_avc_smooth smooth, bool hard_limit, float threshold_db, float attack_dbps, float decay_dbps) {
-	uint16_t thresh = (pow(10, threshold_db / 20) * 0.636) * pow(2, 15);
-	uint16_t att = (1 - pow(10, -(attack_dbps / (20 * 44100)))) * pow(2, 19);
-	uint16_t dec = (1 - pow(10, -(decay_dbps / (20 * 44100)))) * pow(2, 23);
+	uint16_t thresh = powf(10.0f, threshold_db / 20.0f) * 0.636f * 32768.0f;
+	uint16_t att = (1.0f - powf(10.0f, -attack_dbps / (20.0f * 44100.0f))) * 524288.0f;
+	uint16_t dec = (1.0f - powf(10.0f, -decay_dbps / (20.0f * 44100.0f))) * 8388608.0f;
 	avcSetupRaw(thresh, att, dec, (((uint16_t)max_gain & 0x3) << 12) | (((uint16_t)smooth & 0x3) << 8) | ((hard_limit ? 1 : 0) << 5) | (enabled ? 1 : 0));
 }
 
