@@ -93,13 +93,15 @@ void SGTL5000_Driver::init(audio_samplerate samplerate) {
 	write(SGTL5000_ANA_POWER,     0x4060); // External VDDD, stereo ADC path, reference bias on
 	write(SGTL5000_LINREG_CTRL,   0x006C); // VDDIO-assigned charge pump, >3.1 V rails
 	write(SGTL5000_REF_CTRL,      0x01F2); // VAG=1.575 V, +12.5% bias, normal ramp
-	write(SGTL5000_LINE_OUT_CTRL, 0x0F22); // LO_VAG=1.65 V, max line-out drive
+	write(SGTL5000_LINE_OUT_CTRL, 0x0F1F); // LO_VAG=1.575 V, max line-out bias current
 	write(SGTL5000_SHORT_CTRL,    0x5556); // LR short trip = 150 mA
 	write(SGTL5000_ANA_CTRL,      0x0137); // Zero-cross detect active, analog path held muted
 	write(SGTL5000_ANA_POWER,     0x40FF); // Power lineout, HP, ADC, DAC, reference
 	write(SGTL5000_DIG_POWER,     0x0073); // Power I2S in/out, DAP, DAC, ADC
 	delay(100);
-	write(SGTL5000_LINE_OUT_VOL,  0x1212); // Line-out nominal +2 dB attenuation
+	write(SGTL5000_MIC_CTRL,      0x0000); // Mic off: no bias, min gain
+	write(SGTL5000_ANA_ADC_CTRL,  0x0000); // line/mic ADC PGA = 0 dB default
+	write(SGTL5000_LINE_OUT_VOL,  0x0F0F); // Line-out nominal 0 dB when LO_VAG == VAG
 	uint16_t sys_fs = 0x2; // Sample rate
 	if(samplerate == SR_32K ) sys_fs = 0;
 	if(samplerate == SR_44K1) sys_fs = 1;
@@ -181,12 +183,6 @@ void SGTL5000_Driver::micSetup(unsigned int gain_db, float bias_v) {
 
 void SGTL5000_Driver::analogPathSetup(sgtl5000_input input, sgtl5000_headphone headphone, bool headphone_mute, bool lineout_mute) {
 	I2C.acquire();
-	if(input == SGTL5000_IN_LINEIN) {
-		write(SGTL5000_ANA_ADC_CTRL, 0x0055); // +7.5dB gain (1.3Vp-p full scale)
-	} else if(input == SGTL5000_IN_MIC) {
-		write(SGTL5000_MIC_CTRL, 0x0173);      // mic preamp gain = +40dB
-		write(SGTL5000_ANA_ADC_CTRL, 0x0088);  // input gain +12dB
-	}
 	uint16_t ana_ctrl = 0x0026;
 	if(input == SGTL5000_IN_LINEIN) ana_ctrl |= (1 << 2);
 	if(headphone == SGTL5000_HP_DAC) ana_ctrl |= (1 << 6);
