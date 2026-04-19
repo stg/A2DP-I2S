@@ -18,12 +18,12 @@
 
 /*
 TAS5828M
-  [X] start in mono/stereo (untested)
+  [X] start in mono (untested)/stereo
   [X] configure biquads
   [X] configure gain chain
   [X] support class-h power supplies
-  [X] support swap l/r (untested)
-  [ ] support swap phase
+  [X] support swap l/r
+  [X] support swap phase
 
 SGTL5000
   [X] select audio input path *1 (untested)
@@ -43,7 +43,8 @@ AUDIO
   [X] able to do real-time audio streaming to co-processor
   [X] aliasing/imaging verification for resampler
   [X] amp and codec volume changes dB matching
-  [ ] match left/right (don't forget line-in)
+  [X] match line passhthrough gain
+  [X] match left/right (especially line-in/out)
   
 I2C
   [X] threading-safe
