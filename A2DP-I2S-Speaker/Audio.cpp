@@ -1,8 +1,19 @@
 // Audio provides the I2S+A2DP+AVRCP back-end: source switching, event generation, synthesis, mixing, fading, clock tracking and sample rate conversion
 
-#include <driver/gpio.h>
+#include <cstdint>
+#include <cstring>
+#include <driver/i2s_common.h>
+#include <esp_attr.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#if defined(A2DP_I2S_CUSTOM_CORE)
+#include "A2DP_I2SA2DP.h"
+#else
 #include <ESP_I2S.h>
 #include <BluetoothA2DPSink.h>
+#endif
 #include <mp3dec.h>
 #include "Audio.h"
 #include "TAS5828M.h"
@@ -12,19 +23,31 @@
 #include "Comm.h"
 
 // I²S (codec/amp audio signals)
-#define I2S_BCK GPIO_NUM_19  // Bit clock (SCK)
-#define I2S_WCK GPIO_NUM_18  // Word clock (LRCLK/WS)
-#define I2S_TXD GPIO_NUM_21  // Transmit data (SDOUT)
-#define I2S_RXD GPIO_NUM_4   // Receive data (SDIN)
-#define I2S_MCK GPIO_NUM_0   // Master clock (MCLK)
+static constexpr int8_t I2S_BCK = 19; // Bit clock (SCK)
+static constexpr int8_t I2S_WCK = 18; // Word clock (LRCLK/WS)
+static constexpr int8_t I2S_TXD = 21; // Transmit data (SDOUT)
+static constexpr int8_t I2S_RXD = 4;  // Receive data (SDIN)
+static constexpr int8_t I2S_MCK = 0;  // Master clock (MCLK)
 
 // Convert bytes to samples
 #define SAMPLES(BYTES) ((BYTES) >> 2)  // Stereo, 16-bit
 
-// Buffer levels (in bytes)
-#define BUFFER_SIZE    32000
-#define BUFFER_NOMINAL 24000
-#define BUFFER_LOW      8000
+// Audio processing task configuration
+static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
+static constexpr BaseType_t  AUDIO_TASK_CORE     = 1;
+static constexpr uint32_t    AUDIO_TASK_STACK = 1024;
+
+// Buffer levels in bytes. The packet-aware custom path uses a lower-latency
+// operating region; the stock path retains the original levels.
+#if defined(A2DP_I2S_CUSTOM_CORE)
+static constexpr size_t BUFFER_SIZE    = 28000;
+static constexpr size_t BUFFER_NOMINAL = 16000;
+static constexpr size_t BUFFER_LOW     =  6000;
+#else
+static constexpr size_t BUFFER_SIZE    = 32000;
+static constexpr size_t BUFFER_NOMINAL = 24000;
+static constexpr size_t BUFFER_LOW     =  8000;
+#endif
 
 // MP3 decoding
 #define MP3_BUFFER_SIZE (MAX_NCHAN * MAX_NGRAN * MAX_NSAMP)
@@ -387,6 +410,11 @@ constexpr bool polyphase_src = true;
 constexpr bool cubic_src = false;
 constexpr bool linear_src = false;
 
+// Which lost-packet concealer to use?
+// Best enabled will be used, with fall-back to silence.
+constexpr bool conceal_sparse = true;
+constexpr bool conceal_pingpong = true;
+
 // Perform dithering (applies only to polyphase SRC)
 constexpr bool shaped_dither = true;
 
@@ -443,10 +471,6 @@ static uint32_t src_rate = src_nominal; // conversion factor, measured, Q30
 static uint32_t src_rate_internal = src_rate;
 static uint32_t dst_rate = 0x1000000000000000 / src_nominal;
 static uint32_t src_phase = 0;
-
-// Pointer to I2S object
-static i2s_chan_handle_t rx_chan = NULL;
-static i2s_chan_handle_t tx_chan = NULL;
 
 // PRNG
 static uint32_t rng_state = 2463534242u;
@@ -555,6 +579,8 @@ static void cdt_reset() {
   cdt_integrator = 0;
 }
 
+#if !defined(A2DP_I2S_CUSTOM_CORE)
+
 class MyA2DPSink : public BluetoothA2DPSink {
 public:
     
@@ -562,16 +588,15 @@ public:
 
     void app_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) override {
         if(preemption) {
-            
           switch(event) {
             case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT: {
               ESP_LOGI(BT_AV_TAG, "ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT");
               if(is_connected()) {
-                memcpy(pending_new_peer, param->acl_conn_cmpl_stat.bda, ESP_BD_ADDR_LEN);
+                memcpy(pending_new_peer, param->acl_conn_cmpl_stat.bda,
+                       ESP_BD_ADDR_LEN);
                 esp_a2d_disconnect(pending_new_peer);
                 disconnect();
               }
-
             } break;
           }
         }
@@ -586,6 +611,8 @@ private:
     bool preemption = false;
 };
 
+#endif
+
 
 // Audio driver
 class MyA2DPOutput : public BluetoothA2DPOutput {
@@ -597,18 +624,411 @@ public:
     return true;
   };
   void end() override {}
-  void set_output_active(bool active) override{};
+  void set_output_active(bool active) override {
+#if defined(A2DP_I2S_CUSTOM_CORE)
+    source_sample_index_valid = false;
+#endif
+    (void)active;
+  };
 
   // Seed the sample-rate-converter with an appropriate factor
   void set_sample_rate(int rate) override {
-    //Comm.printf("Sample rate configured: %u\n", rate);
+    Comm.printf("Sample rate configured: %u\n", rate);
     source_samplerate = rate;
     src_nominal = (uint64_t)0x40000000 * source_samplerate / sink_samplerate;
     cdt_reset();
+#if defined(A2DP_I2S_CUSTOM_CORE)
+    source_sample_index_valid = false;
+#endif
   };
 
   // Write A2DP stream to buffer (called from A2DP sink)
-  size_t write(const uint8_t *data, size_t _len) override {
+  // Lost-packet concealment happens here
+#if defined(A2DP_I2S_CUSTOM_CORE)
+  size_t write(const uint8_t *data, size_t length, uint64_t packet_arrival_us, uint32_t source_sample_index) override {
+    (void)packet_arrival_us;
+    const size_t pcm_frames = length / (sizeof(int16_t) * 2);
+    size_t missing_frames = 0;
+    if(source_sample_index_valid) {
+      const uint32_t distance = source_sample_index - next_source_sample_index;
+      const size_t maximum_gap = BUFFER_SIZE / (sizeof(int16_t) * 2);
+      if(distance > 0 && distance < 0x80000000u && distance <= maximum_gap) {
+        missing_frames = distance;
+      }
+    }
+    source_sample_index_valid = true;
+    next_source_sample_index = source_sample_index + pcm_frames;
+
+    if(missing_frames) {
+      size_t pre_gap_bytes = buffer_fill;
+      const size_t maximum_pre_gap_bytes = pcm_frames * sizeof(int16_t) * 2;
+      if(pre_gap_bytes > maximum_pre_gap_bytes) {
+        pre_gap_bytes = maximum_pre_gap_bytes;
+      }
+
+      const uint8_t *pre_gap_end = buffer_head;
+      if(pre_gap_end == buffer) pre_gap_end = buffer + sizeof(buffer);
+      const size_t contiguous_bytes = pre_gap_end - buffer;
+      if(pre_gap_bytes > contiguous_bytes) {
+        pre_gap_bytes = contiguous_bytes;
+      }
+      pre_gap_bytes &= ~(sizeof(int16_t) * 2 - 1);
+
+      const int16_t *pre_gap = pre_gap_bytes ? reinterpret_cast<const int16_t *>(pre_gap_end - pre_gap_bytes) : nullptr;
+      conceal(missing_frames, pre_gap, pre_gap_bytes / (sizeof(int16_t) * 2), reinterpret_cast<const int16_t *>(data), pcm_frames);
+    }
+#else
+  size_t write(const uint8_t *data, size_t length) override {
+#endif
+    return write_buffer(data, length);
+  }
+
+private:
+#if defined(A2DP_I2S_CUSTOM_CORE)
+  bool source_sample_index_valid = false;
+  uint32_t next_source_sample_index = 0;
+
+  // The sparse model searches a modest pitch/history window and retains only
+  // four non-contiguous predictors.  A bounded reverse prediction buffer keeps
+  // the normal path allocation-free while covering two consecutive four-frame
+  // RTP packets. Centered fitting data is cached once per gap so OMP does not
+  // repeatedly reverse, index and subtract means in its inner loops.
+  static constexpr size_t SPARSE_MAXIMUM_LAG = 40;
+  static constexpr size_t SPARSE_TAP_COUNT = 4;
+  static constexpr size_t SPARSE_MAXIMUM_CONTEXT_FRAMES = 128;
+  static constexpr size_t SPARSE_MAXIMUM_GAP_FRAMES = 1024;
+  float sparse_training[4][SPARSE_MAXIMUM_CONTEXT_FRAMES];
+  union {
+    float sparse_residual[4][SPARSE_MAXIMUM_CONTEXT_FRAMES];
+    int16_t sparse_reverse_prediction[SPARSE_MAXIMUM_GAP_FRAMES * 2];
+  };
+
+  size_t conceal(size_t missing_frames, const int16_t *pre_gap, size_t pre_gap_frames, const int16_t *post_gap, size_t post_gap_frames) {
+    if(conceal_sparse) {
+      if(pre_gap && pre_gap_frames && post_gap && post_gap_frames && missing_frames <= SPARSE_MAXIMUM_GAP_FRAMES) {
+        return conceal_with_sparse(missing_frames, pre_gap, pre_gap_frames, post_gap, post_gap_frames);
+      }
+    } else if(conceal_pingpong && pre_gap && pre_gap_frames && post_gap && post_gap_frames) {
+      return conceal_with_pingpong(missing_frames, pre_gap, pre_gap_frames, post_gap, post_gap_frames);
+    }
+    return conceal_with_silence(missing_frames);
+  }
+
+  static bool solve_sparse_normal_equation(float matrix[SPARSE_TAP_COUNT][SPARSE_TAP_COUNT + 1], size_t order, float *coeffs) {
+    for(size_t column = 0; column < order; ++column) {
+      size_t pivot = column;
+      float pivot_magnitude = matrix[pivot][column] < 0.0f ? -matrix[pivot][column] : matrix[pivot][column];
+      for(size_t row = column + 1; row < order; ++row) {
+        const float magnitude = matrix[row][column] < 0.0f ? -matrix[row][column] : matrix[row][column];
+        if(magnitude > pivot_magnitude) {
+          pivot = row;
+          pivot_magnitude = magnitude;
+        }
+      }
+      if(pivot_magnitude < 1.0e-12f) return false;
+      if(pivot != column) {
+        for(size_t item = column; item <= order; ++item) {
+          const float temporary = matrix[column][item];
+          matrix[column][item] = matrix[pivot][item];
+          matrix[pivot][item] = temporary;
+        }
+      }
+
+      const float divisor = matrix[column][column];
+      for(size_t item = column; item <= order; ++item) {
+        matrix[column][item] /= divisor;
+      }
+      for(size_t row = 0; row < order; ++row) {
+        if(row == column) continue;
+        const float factor = matrix[row][column];
+        for(size_t item = column; item <= order; ++item) {
+          matrix[row][item] -= factor * matrix[column][item];
+        }
+      }
+    }
+    for(size_t index = 0; index < order; ++index) {
+      coeffs[index] = matrix[index][order];
+    }
+    return true;
+  }
+
+  bool fit_sparse_predictor(const int16_t *pre_gap, size_t pre_gap_frames, const int16_t *post_gap, size_t post_gap_frames, uint8_t *lags, float *coeffs, float means[2][2], size_t &context_frames) {
+    context_frames = pre_gap_frames < post_gap_frames ? pre_gap_frames : post_gap_frames;
+    if(context_frames > SPARSE_MAXIMUM_CONTEXT_FRAMES) {
+      context_frames = SPARSE_MAXIMUM_CONTEXT_FRAMES;
+    }
+    if(context_frames <= SPARSE_MAXIMUM_LAG) return false;
+
+    // Retain the samples nearest each edge. The post edge is traversed in
+    // reverse so one model describes prediction inward from either boundary.
+    pre_gap += (pre_gap_frames - context_frames) * 2;
+    const int16_t *edges[2] = { pre_gap, post_gap };
+    for(size_t edge = 0; edge < 2; ++edge) {
+      for(size_t channel = 0; channel < 2; ++channel) {
+        int32_t sum = 0;
+        for(size_t frame = 0; frame < context_frames; ++frame) {
+          sum += edges[edge][frame * 2 + channel];
+        }
+        means[edge][channel] = static_cast<float>(sum) / context_frames;
+        const size_t sequence = edge * 2 + channel;
+        for(size_t frame = 0; frame < context_frames; ++frame) {
+          const size_t source_frame = edge ? context_frames - 1 - frame : frame;
+          sparse_training[sequence][frame] = static_cast<float>(edges[edge][source_frame * 2 + channel]) - means[edge][channel];
+          sparse_residual[sequence][frame] = sparse_training[sequence][frame];
+        }
+      }
+    }
+
+    size_t selected_count = 0;
+    for(size_t iteration = 0; iteration < SPARSE_TAP_COUNT; ++iteration) {
+      size_t best_lag = 1;
+      float best_score = -1.0f;
+      for(size_t candidate = 1; candidate <= SPARSE_MAXIMUM_LAG; ++candidate) {
+        bool selected = false;
+        for(size_t tap = 0; tap < selected_count; ++tap) {
+          if(lags[tap] == candidate) {
+            selected = true;
+            break;
+          }
+        }
+        if(selected) continue;
+
+        float correlation = 0.0f;
+        float energy = 0.0f;
+        for(size_t sequence = 0; sequence < 4; ++sequence) {
+            for(size_t frame = SPARSE_MAXIMUM_LAG; frame < context_frames; ++frame) {
+              const float predictor = sparse_training[sequence][frame - candidate];
+              correlation += predictor * sparse_residual[sequence][frame];
+              energy += predictor * predictor;
+            }
+        }
+        const float score = correlation * correlation / (energy + 1.0f);
+        if(score > best_score) {
+          best_score = score;
+          best_lag = candidate;
+        }
+      }
+      lags[selected_count++] = static_cast<uint8_t>(best_lag);
+
+      float equation[SPARSE_TAP_COUNT][SPARSE_TAP_COUNT + 1] = {};
+      for(size_t sequence = 0; sequence < 4; ++sequence) {
+          for(size_t frame = SPARSE_MAXIMUM_LAG; frame < context_frames; ++frame) {
+            const float target = sparse_training[sequence][frame];
+            for(size_t row = 0; row < selected_count; ++row) {
+              const float predictor_row = sparse_training[sequence][frame - lags[row]];
+              equation[row][selected_count] += predictor_row * target;
+              for(size_t column = 0; column < selected_count; ++column) {
+                equation[row][column] += predictor_row * sparse_training[sequence][frame - lags[column]];
+              }
+            }
+          }
+      }
+      float trace = 0.0f;
+      for(size_t tap = 0; tap < selected_count; ++tap) trace += equation[tap][tap];
+      const float ridge = trace / selected_count * 1.0e-5f + 1.0e-6f;
+      for(size_t tap = 0; tap < selected_count; ++tap) equation[tap][tap] += ridge;
+      if(!solve_sparse_normal_equation(equation, selected_count, coeffs)) return false;
+      if(iteration + 1 < SPARSE_TAP_COUNT) {
+        for(size_t sequence = 0; sequence < 4; ++sequence) {
+          for(size_t frame = SPARSE_MAXIMUM_LAG; frame < context_frames; ++frame) {
+            float residual = sparse_training[sequence][frame];
+            for(size_t tap = 0; tap < selected_count; ++tap) {
+              residual -= coeffs[tap] * sparse_training[sequence][frame - lags[tap]];
+            }
+            sparse_residual[sequence][frame] = residual;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  static inline __attribute__((always_inline)) int16_t sparse_pcm_sample(float sample) {
+    if(sample > 32767.0f) return 32767;
+    if(sample < -32768.0f) return -32768;
+    return static_cast<int16_t>(sample + (sample >= 0.0f ? 0.5f : -0.5f));
+  }
+
+  static inline __attribute__((always_inline)) float predict_sparse_sample(float history[SPARSE_MAXIMUM_LAG][2], size_t history_head, size_t channel, const uint8_t *lags, const float *coeffs, float limit) {
+    float prediction = 0.0f;
+    for(size_t tap = 0; tap < SPARSE_TAP_COUNT; ++tap) {
+      size_t index = history_head + SPARSE_MAXIMUM_LAG - lags[tap];
+      if(index >= SPARSE_MAXIMUM_LAG) index -= SPARSE_MAXIMUM_LAG;
+      prediction += coeffs[tap] * history[index][channel];
+    }
+    if(prediction > limit) prediction = limit;
+    if(prediction < -limit) prediction = -limit;
+    return prediction;
+  }
+
+  size_t conceal_with_sparse(size_t missing_frames, const int16_t *pre_gap, size_t pre_gap_frames, const int16_t *post_gap, size_t post_gap_frames) {
+    uint8_t lags[SPARSE_TAP_COUNT] = {};
+    float coeffs[SPARSE_TAP_COUNT] = {};
+    float means[2][2] = {};
+    size_t context_frames = 0;
+    if(!fit_sparse_predictor(pre_gap, pre_gap_frames, post_gap, post_gap_frames, lags, coeffs, means, context_frames)) {
+      return conceal_with_silence(missing_frames);
+    }
+    float reverse_history[SPARSE_MAXIMUM_LAG][2];
+    float reverse_limits[2];
+    for(size_t channel = 0; channel < 2; ++channel) {
+      float maximum = 0.0f;
+      for(size_t frame = 0; frame < context_frames; ++frame) {
+        const float magnitude = sparse_training[2 + channel][frame] < 0.0f ? -sparse_training[2 + channel][frame] : sparse_training[2 + channel][frame];
+        if(magnitude > maximum) maximum = magnitude;
+      }
+      reverse_limits[channel] = maximum * 1.5f;
+      if(reverse_limits[channel] < 64.0f) reverse_limits[channel] = 64.0f;
+      for(size_t frame = 0; frame < SPARSE_MAXIMUM_LAG; ++frame) {
+        reverse_history[frame][channel] = sparse_training[2 + channel][context_frames - SPARSE_MAXIMUM_LAG + frame];
+      }
+    }
+    size_t reverse_head = 0;
+    for(size_t frame = 0; frame < missing_frames; ++frame) {
+      for(size_t channel = 0; channel < 2; ++channel) {
+        const float centered = predict_sparse_sample(reverse_history, reverse_head, channel, lags, coeffs, reverse_limits[channel]);
+        reverse_history[reverse_head][channel] = centered;
+        sparse_reverse_prediction[frame * 2 + channel] = sparse_pcm_sample(centered + means[1][channel]);
+      }
+      if(++reverse_head == SPARSE_MAXIMUM_LAG) reverse_head = 0;
+    }
+
+    float forward_history[SPARSE_MAXIMUM_LAG][2];
+    float forward_limits[2];
+    for(size_t channel = 0; channel < 2; ++channel) {
+      float maximum = 0.0f;
+      for(size_t frame = 0; frame < context_frames; ++frame) {
+        const float magnitude = sparse_training[channel][frame] < 0.0f ? -sparse_training[channel][frame] : sparse_training[channel][frame];
+        if(magnitude > maximum) maximum = magnitude;
+      }
+      forward_limits[channel] = maximum * 1.5f;
+      if(forward_limits[channel] < 64.0f) forward_limits[channel] = 64.0f;
+      for(size_t frame = 0; frame < SPARSE_MAXIMUM_LAG; ++frame) {
+        forward_history[frame][channel] = sparse_training[channel][context_frames - SPARSE_MAXIMUM_LAG + frame];
+      }
+    }
+    size_t forward_head = 0;
+    size_t written_frames = 0;
+    int16_t generated[AUDIO_CHUNK_SIZE / sizeof(int16_t)];
+    const size_t generated_capacity = AUDIO_CHUNK_SIZE / (sizeof(int16_t) * 2);
+
+    const uint32_t phase_denominator = missing_frames > 1 ? missing_frames - 1 : 1;
+    const uint32_t phase_step = missing_frames > 1 ? static_cast<uint32_t>(0x80000000ull / phase_denominator) : 0;
+    const uint32_t phase_remainder = missing_frames > 1 ? static_cast<uint32_t>(0x80000000ull % phase_denominator) : 0;
+    uint32_t phase = 0;
+    uint32_t phase_error = 0;
+
+    while(written_frames < missing_frames) {
+      size_t count = missing_frames - written_frames;
+      if(count > generated_capacity) count = generated_capacity;
+      for(size_t index = 0; index < count; ++index) {
+        const size_t frame = written_frames + index;
+        const uint32_t post_weight = missing_frames > 1 ? static_cast<uint32_t>((0x40000000ll - cosine(phase) + 32768) >> 16) : 16384;
+        const uint32_t pre_weight = 32768 - post_weight;
+        for(size_t channel = 0; channel < 2; ++channel) {
+          const float centered = predict_sparse_sample(forward_history, forward_head, channel, lags, coeffs, forward_limits[channel]);
+          forward_history[forward_head][channel] = centered;
+          const int32_t forward = sparse_pcm_sample(centered + means[0][channel]);
+          const int32_t reverse = sparse_reverse_prediction[(missing_frames - 1 - frame) * 2 + channel];
+          const int64_t mixed = static_cast<int64_t>(forward) * pre_weight + static_cast<int64_t>(reverse) * post_weight;
+          generated[index * 2 + channel] = static_cast<int16_t>((mixed + 16384) >> 15);
+        }
+        if(++forward_head == SPARSE_MAXIMUM_LAG) forward_head = 0;
+        if(missing_frames > 1) {
+          phase += phase_step;
+          phase_error += phase_remainder;
+          if(phase_error >= phase_denominator) {
+            ++phase;
+            phase_error -= phase_denominator;
+          }
+        }
+      }
+
+      const size_t bytes = count * sizeof(int16_t) * 2;
+      const size_t written = write_buffer(reinterpret_cast<const uint8_t *>(generated), bytes);
+      written_frames += written / (sizeof(int16_t) * 2);
+      if(written < bytes) break;
+    }
+    return written_frames;
+  }
+
+  static size_t pingpong_offset(size_t distance, size_t frames) {
+    if(frames < 2) return 0;
+    const size_t period = (frames - 1) * 2;
+    size_t offset = distance % period;
+    if(offset >= frames) offset = period - offset;
+    return offset;
+  }
+
+  size_t conceal_with_pingpong(size_t missing_frames, const int16_t *pre_gap, size_t pre_gap_frames, const int16_t *post_gap, size_t post_gap_frames) {
+    size_t written_frames = 0;
+    int16_t generated[AUDIO_CHUNK_SIZE / sizeof(int16_t)];
+    const size_t generated_capacity = AUDIO_CHUNK_SIZE / (sizeof(int16_t) * 2);
+
+    // Q15 linear crossfade. Distribute the remainder incrementally so the
+    // first frame is entirely pre-gap and the last entirely post-gap without
+    // a division for every generated sample.
+    const uint32_t weight_denominator = missing_frames > 1 ? missing_frames - 1 : 1;
+    const uint32_t weight_step = missing_frames > 1 ? 32768 / weight_denominator : 0;
+    const uint32_t weight_remainder = missing_frames > 1 ? 32768 % weight_denominator : 0;
+    uint32_t post_weight = missing_frames > 1 ? 0 : 16384;
+    uint32_t weight_error = 0;
+
+    while(written_frames < missing_frames) {
+      size_t count = missing_frames - written_frames;
+      if(count > generated_capacity) count = generated_capacity;
+
+      for(size_t i = 0; i < count; ++i) {
+        const size_t frame = written_frames + i;
+        const size_t pre_offset = pingpong_offset(frame + 1, pre_gap_frames);
+        const size_t post_offset = pingpong_offset(missing_frames - frame, post_gap_frames);
+        const size_t pre_frame = pre_gap_frames - 1 - pre_offset;
+        const uint32_t pre_weight = 32768 - post_weight;
+
+        for(size_t channel = 0; channel < 2; ++channel) {
+          const int32_t pre_sample = pre_gap[pre_frame * 2 + channel];
+          const int32_t post_sample = post_gap[post_offset * 2 + channel];
+          const int64_t mixed = static_cast<int64_t>(pre_sample) * pre_weight + static_cast<int64_t>(post_sample) * post_weight;
+          generated[i * 2 + channel] = static_cast<int16_t>((mixed + 16384) >> 15);
+        }
+
+        if(missing_frames > 1) {
+          post_weight += weight_step;
+          weight_error += weight_remainder;
+          if(weight_error >= weight_denominator) {
+            ++post_weight;
+            weight_error -= weight_denominator;
+          }
+        }
+      }
+
+      const size_t bytes = count * sizeof(int16_t) * 2;
+      const size_t written = write_buffer(reinterpret_cast<const uint8_t *>(generated), bytes);
+      written_frames += written / (sizeof(int16_t) * 2);
+      if(written < bytes) break;
+    }
+    return written_frames;
+  }
+
+  size_t conceal_with_silence(size_t missing_frames) {
+
+    size_t written_frames = 0;
+    const int16_t generated[AUDIO_CHUNK_SIZE / sizeof(int16_t)] = {};
+    const size_t generated_capacity = AUDIO_CHUNK_SIZE / (sizeof(int16_t) * 2);
+
+    while(written_frames < missing_frames) {
+      size_t count = missing_frames - written_frames;
+      if(count > generated_capacity) count = generated_capacity;
+      const size_t bytes = count * sizeof(int16_t) * 2;
+      const size_t written = write_buffer(reinterpret_cast<const uint8_t *>(generated), bytes);
+      written_frames += written / (sizeof(int16_t) * 2);
+      if(written < bytes) break;
+    }
+    return written_frames;
+  }
+#endif
+
+  size_t write_buffer(const uint8_t *data, size_t _len) {
     size_t buffer_free = BUFFER_SIZE - buffer_fill;
     size_t len = ((_len > buffer_free) ? buffer_free : _len);
 
@@ -631,12 +1051,21 @@ public:
 
     return len;
   }
+
 };
 
 // Import audio objects
+static i2s_chan_handle_t rx_chan = NULL;
+static i2s_chan_handle_t tx_chan = NULL;
+#if !defined(A2DP_I2S_CUSTOM_CORE)
 static I2SClass i2s_device;
+#endif
 static MyA2DPOutput a2dp_output;
+#if defined(A2DP_I2S_CUSTOM_CORE)
+static A2DP_I2SA2DPSink a2dp_sink(a2dp_output);
+#else
 static MyA2DPSink a2dp_sink(a2dp_output);
+#endif
 
 // Reads A2DP stream from buffer 
 //   Does NOT check if enough data is available, because of this must be called as follows:
@@ -682,10 +1111,10 @@ static size_t read_a2dp_chunk(uint8_t *chunk_out) {
   while(samples--) {
     // Sample input by...
     if(polyphase_src) {
+      // ...convolution with the appropriate phase from the polyphase filterbank
       const int32_t *kernel = (int32_t*)src_polyphase_filterbank[(src_phase / (0x20000000 / SRCPP_PHASES)) & (SRCPP_PHASES - 1)];
       for(uint8_t ch = 0; ch < 2; ch++) {
         int32_t sample = 0;
-        // ...convolution with the appropriate phase from the polyphase filterbank
         sample = convolve_q16q32_circular(&src_2x[src_2x_index + src_phase / 0x20000000][ch], 1, (int16_t *)src_2x, (int16_t *)(src_2x + SRCPP_TAPS + 2), kernel, SRCPP_TAPS);
         sample += (1 << (SRCPP_Q - 17)); // Apply rounding correction
         // Apply dithering
@@ -820,9 +1249,15 @@ static size_t write_i2s_chunk(uint8_t *data) {
 }
 
 // Called when AVRC metadata arrives from the connected source
+#if !defined(A2DP_I2S_CUSTOM_CORE)
 static void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
+#else
+static void avrc_metadata_callback(uint8_t id, const uint8_t *text, size_t length) {
+#endif
   const char *data = (const char *)text;
-  size_t length = strlen(data);
+#if !defined(A2DP_I2S_CUSTOM_CORE)
+  const size_t length = strlen(data);
+#endif
   if(cb_metadata) cb_metadata(id, data, length);
 }
 
@@ -896,7 +1331,12 @@ static void audio_processor(void *dummy) {
 
     // If source is not I2S, read it first to maintain timing
     // Actual source will overwrite the chunk later
+#if defined(A2DP_I2S_CUSTOM_CORE)
+    /* TX DMA supplies the render clock while Bluetooth is selected. RX DMA
+       continues running and discards old input descriptors independently. */
+#else
     if(source != SRC_ANALOG) read_i2s_chunk(chunk);
+#endif
 
     if(streaming) {
 
@@ -1050,15 +1490,17 @@ static void audio_processor(void *dummy) {
 // Initialize audio driver
 void Audio_Driver::init(const char *name, audio_samplerate samplerate, bool preemption, bool mclk) {
 
-  // Free some unused memory allocated to BLE (which we will never use)
-  //esp_bt_mem_release(ESP_BT_MODE_BLE); // 4,728 freed => 178000 total on 3.0.7
-
   sink_samplerate = samplerate;
 
   buffer_access = xSemaphoreCreateBinary();
   xSemaphoreGive(buffer_access);
 
   // Start I²S
+#if defined(A2DP_I2S_CUSTOM_CORE)
+  a2dp_sink.begin_i2s(samplerate, mclk,
+                       I2S_BCK, I2S_WCK, I2S_TXD, I2S_RXD, I2S_MCK,
+                       rx_chan, tx_chan);
+#else
   if(mclk) {
     i2s_device.setPins(I2S_BCK, I2S_WCK, I2S_TXD, I2S_RXD, I2S_MCK);
     //gpio_set_drive_capability(I2S_MCK, GPIO_DRIVE_CAP_2);  // Changing this may vastly improve signal integrity
@@ -1066,6 +1508,7 @@ void Audio_Driver::init(const char *name, audio_samplerate samplerate, bool pree
     i2s_device.setPins(I2S_BCK, I2S_WCK, I2S_TXD, I2S_RXD);
   }
   if(!i2s_device.begin(I2S_MODE_STD, samplerate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) ESP_ERROR_CHECK(ESP_FAIL);
+#endif
 
   // Start A2DP Bluetooth service
   a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST | ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME);
@@ -1077,18 +1520,20 @@ void Audio_Driver::init(const char *name, audio_samplerate samplerate, bool pree
   // This delay prevents crashes due to excessive CPU use when A2DPSink wants to write to a full buffer
   a2dp_sink.set_max_write_delay_ms(1);
   
+  // Configure takeover before start: the reduced backend snapshots this flag
+  // into its low-level connection state during initialization.
+  a2dp_sink.enable_preemption(preemption);
   a2dp_sink.start(name);
   
-  // Allow incoming connections to disconnect current connection (take over)
-  a2dp_sink.enable_preemption(preemption);
-
   // Configure source clock drift filter
   biquad_filter f = biquadMake(FILTER_LOWPASS, (float)samplerate / SAMPLES(AUDIO_CHUNK_SIZE), 1.0, 0.7);
   cdt_filter = biquadQ(&f, 30);
 
   // Fetch channels for lower-layer I2S access
+#if !defined(A2DP_I2S_CUSTOM_CORE)
   rx_chan = i2s_device.rxChan();
   tx_chan = i2s_device.txChan();
+#endif
 
   // Create event queue
   eventQueue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(audio_event));
@@ -1102,8 +1547,7 @@ void Audio_Driver::init(const char *name, audio_samplerate samplerate, bool pree
 
 // Start everything
 void Audio_Driver::begin() {
-  // Create application
-  xTaskCreate(audio_processor, "Audio Processor", 1024, NULL, 1, NULL);
+  xTaskCreatePinnedToCore(audio_processor, "Audio Processor", AUDIO_TASK_STACK, NULL, AUDIO_TASK_PRIORITY, NULL, AUDIO_TASK_CORE);
 }
 
 // Play MP3
@@ -1223,7 +1667,11 @@ void Audio_Driver::sendCommand(audio_command command, bool pressed) {
     case CMD_VOLDEC: avrc_cmd = ESP_AVRC_PT_CMD_VOL_DOWN;     break;
     default: return;
   }
+#if defined(A2DP_I2S_CUSTOM_CORE)
+  a2dp_sink.send_passthrough(avrc_cmd, pressed);
+#else
   esp_avrc_ct_send_passthrough_cmd(0, avrc_cmd, pressed ? ESP_AVRC_PT_CMD_STATE_PRESSED : ESP_AVRC_PT_CMD_STATE_RELEASED);
+#endif
 }
 
 // Set audio event handler

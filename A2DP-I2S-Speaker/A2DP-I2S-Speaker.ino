@@ -1,6 +1,8 @@
-// Designed for ESP32
-// esp32 library version 3.0.7 (recent versions use more ram and will fail)
-// pschatzmann/ESP32-A2DP library version 1.8.8
+// Designed for ESP32, compiled against either:
+// * Custom A2DP-I2S ESP32 Core (preferred)
+// or:
+// * esp32 library version 3.0.7 (recent versions use too much RAM and will fail or run unreliably)
+// * pschatzmann/ESP32-A2DP library version 1.8.8 (other versions may work, but no guarantees)
 
 #include "TAS5828M.h"
 #include "SGTL5000.h"
@@ -14,7 +16,7 @@
 #define USE_TAS5828M 1
 #define HAVE_VOL_POT 1 // else uses tas5828m_gain, sgtl5000_gain
 
-#define DEVICE_NAME "MySpeaker"
+#define DEVICE_NAME "TAS5830"
 
 /*
 TAS5828M
@@ -45,6 +47,7 @@ AUDIO
   [X] amp and codec volume changes dB matching
   [X] match line passhthrough gain
   [X] match left/right (especially line-in/out)
+	[X] lost packet concealment
   
 I2C
   [X] threading-safe
@@ -342,7 +345,7 @@ void setup_tas5828m() {
 
   // Set final gain stage for hybrid modulation
   constexpr float chipVmax = 33.1f; // TAS2858M: 29.4V TAS5830: 33.1V
-  constexpr float psuVmax  = 28.5f; // Measured Vrms/min @ 100% Class-H PWM
+  constexpr float psuVmax  = 29.4f; // Measured Vrms/min @ 100% Class-H PWM
   float gainDb = 20.0f * log10f(psuVmax / chipVmax); // ideal gain
   TAS5828M.analogGain(floorf(gainDb * 2.0f) / 2.0f); // round down
 
@@ -390,7 +393,7 @@ void setup() {
   Audio.setConnectionHandler(Comm.getConnectionHandler());
   Audio.setAudioHandler(Comm.getAudioHandler());
   Audio.setEventHandler(audio_event_handler);
-  Audio.init(DEVICE_NAME, SR_48K, false);
+  Audio.init(DEVICE_NAME, SR_48K, true);
 
   // Audio hardware
 #if USE_TAS5828M

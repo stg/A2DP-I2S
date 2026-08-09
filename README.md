@@ -18,6 +18,7 @@ Optionally complimented by:
 	
 Notable high-end features:
 - [True clock drift compensation](#clock-drift-compensation)
+- [Packet-loss concealment](#packet-loss-concealment)
 - [Polyphase resampling](#polyphase-resampling)
 - [Live system response tuning](#filter-design-and-live-tuning)
 
@@ -92,6 +93,10 @@ The common inelegant solution is to simple drop/duplicate incoming samples.
 There are several much more elegant ways of solving this, including clock synchronization and resampling.
 This code in particular uses a clock skew detector (may be in ppm) and resampling of the stream to the local clock.
 
+## Packet-loss concealment
+
+The custom core preserves source sample position through the A2DP path, allowing real packet loss to be distinguished from ordinary late delivery. Missing audio is reconstructed by an ESP32-oriented sparse predictor using the signal on both sides of the gap, reducing clicks and discontinuities without concealing normal radio jitter.
+
 ## Polyphase resampling
 
 Fast resampling to solve both clock-drift and up-sampling can be tricky.
@@ -112,6 +117,12 @@ To ensure best chance of getting this to work:
 - Ensure playback is active
 
 For the backend that supports professional-grade audio paths in BQDTS, see [bqdts-backend](https://github.com/stg/bqdts-backend).
+
+## Custom Arduino core
+
+Install the official Espressif ESP32 3.x board package in Arduino IDE, extract the latest archive from [`A2DP-I2S-Board/zipped`](A2DP-I2S-Board/zipped), then run `python install.py`. Restart Arduino IDE and select **A2DP-I2S ESP32**. Rerun the installer after changing the official ESP32 board-package version.
+
+The installer accepts Arduino-ESP32 3.0.7 through 3.x, warns for unvalidated versions, and creates a separate board without modifying the official ESP32 installation. The custom core provides a significantly shortened A2DP path, reduced RAM/ROM usage, audio packet telemetry, and 44.1/48 kHz A2DP negotiation.
 
 ## Attribution
 
